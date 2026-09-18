@@ -29,12 +29,14 @@ class TestCalculate(unittest.TestCase):
             calculate(2, True)
 
     def test_non_numeric_first_arg_raises_type_error(self):
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError) as cm:
             calculate("10", 2)
+        self.assertEqual(str(cm.exception), "Expected a to be int or float, got str")
 
     def test_non_numeric_second_arg_raises_type_error(self):
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError) as cm:
             calculate(10, "2")
+        self.assertEqual(str(cm.exception), "Expected b to be int or float, got str")
 
     def test_none_arg_raises_type_error(self):
         with self.assertRaises(TypeError):
