@@ -221,13 +221,7 @@ class TestOnboardingHttpFlow(unittest.TestCase):
         return response.status, content
 
     def test_http_review_submit_approval_and_hr_flow(self):
-        status, review_body = self.request("POST", "/review", valid_request_data())
-        draft_token = re.search(r'name="token" value="([^"]+)"', review_body).group(1)
-
-        self.assertEqual(status, 200)
-        self.assertIn("Review &amp; Submit", review_body)
-
-        status, submit_body = self.request("POST", "/submit", {"token": draft_token})
+        status, submit_body = self.submit_valid_request()
         request_id = re.search(
             r"<tr><th>Request ID</th><td>([^<]+)</td></tr>", submit_body
         ).group(1)
@@ -254,6 +248,55 @@ class TestOnboardingHttpFlow(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertIn("Onboarding Ready", hr_body)
+
+    def test_http_manager_action_requires_valid_code(self):
+        status, submit_body = self.submit_valid_request()
+        request_id = re.search(
+            r"<tr><th>Request ID</th><td>([^<]+)</td></tr>", submit_body
+        ).group(1)
+
+        status, manager_body = self.request(
+            "POST",
+            f"/manager/{request_id}",
+            {"token": "wrong-token", "decision": "approve"},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("Invalid or missing action token", manager_body)
+
+    def test_http_hr_action_requires_valid_code(self):
+        status, submit_body = self.submit_valid_request()
+        request_id = re.search(
+            r"<tr><th>Request ID</th><td>([^<]+)</td></tr>", submit_body
+        ).group(1)
+        manager_code = re.search(
+            r"manager action code ([0-9a-f-]+)", submit_body
+        ).group(1)
+        self.request(
+            "POST",
+            f"/manager/{request_id}",
+            {"token": manager_code, "decision": "approve"},
+        )
+
+        status, hr_body = self.request(
+            "POST", f"/hr/{request_id}", {"token": "wrong-token"}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("Invalid or missing action token", hr_body)
+
+    def submit_valid_request(self):
+        status, review_body = self.request("POST", "/review", valid_request_data())
+        draft_token = re.search(r'name="token" value="([^"]+)"', review_body).group(1)
+
+        self.assertEqual(status, 200)
+        self.assertIn("Review &amp; Submit", review_body)
+
+        status, submit_body = self.request("POST", "/submit", {"token": draft_token})
+
+        self.assertEqual(status, 200)
+        self.assertIn("Submitted", submit_body)
+        return status, submit_body
 
 
 if __name__ == "__main__":

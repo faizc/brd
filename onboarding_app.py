@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import hmac
 import json
 import sqlite3
 import threading
@@ -75,6 +76,7 @@ def connect(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 5000")
+    # SQLite does not support WAL mode for in-memory databases.
     if str(db_path) != ":memory:":
         connection.execute("PRAGMA journal_mode = WAL")
     return connection
@@ -307,7 +309,8 @@ def verify_action_token(
         "manager": "ManagerActionToken",
         "hr": "HrActionToken",
     }[action]
-    return bool(token) and request[token_column] == token
+    expected_token = request[token_column] or ""
+    return bool(token) and hmac.compare_digest(expected_token, token)
 
 
 def get_request(connection: sqlite3.Connection, request_id: str) -> sqlite3.Row | None:
@@ -634,8 +637,8 @@ class OnboardingHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(length).decode()
-        data = normalize_form(parse_qs(raw_body))
         parsed_body = parse_qs(raw_body)
+        data = normalize_form(parsed_body)
 
         if self.path == "/review":
             errors = validate_request(data)
