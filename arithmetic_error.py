@@ -1,6 +1,11 @@
 """Simple arithmetic program with proper error handling."""
 
 
+def _is_valid_number(value):
+    """Return True if value is an int or float, excluding bool."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def calculate(a, b):
     """Return (sum, difference, product, quotient) of a and b.
 
@@ -8,7 +13,7 @@ def calculate(a, b):
         TypeError: If either a or b is not an int or float.
         ZeroDivisionError: If b is 0, since division by zero is undefined.
     """
-    if isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+    if not _is_valid_number(a) or not _is_valid_number(b):
         raise TypeError("Both a and b must be int or float")
 
     sum_result = a + b
