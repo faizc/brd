@@ -22,10 +22,9 @@ def calculate(a, b):
     diff_result = a - b
     product_result = a * b
 
-    try:
-        quotient_result = a / b
-    except ZeroDivisionError as exc:
-        raise ZeroDivisionError("Cannot divide by zero") from exc
+    if b == 0:
+        raise ZeroDivisionError("Cannot divide by zero")
+    quotient_result = a / b
 
     return sum_result, diff_result, product_result, quotient_result
 
