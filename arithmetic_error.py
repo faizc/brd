@@ -17,13 +17,12 @@ def calculate(a, b):
         raise TypeError(f"Expected a to be int or float, got {type(a).__name__}")
     if not _is_valid_number(b):
         raise TypeError(f"Expected b to be int or float, got {type(b).__name__}")
+    if b == 0:
+        raise ZeroDivisionError("Cannot divide by zero")
 
     sum_result = a + b
     diff_result = a - b
     product_result = a * b
-
-    if b == 0:
-        raise ZeroDivisionError("Cannot divide by zero")
     quotient_result = a / b
 
     return sum_result, diff_result, product_result, quotient_result
