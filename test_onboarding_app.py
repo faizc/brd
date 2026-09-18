@@ -7,6 +7,8 @@ from onboarding_app import (
     DEPARTMENTS,
     OFFICE_LOCATIONS,
     create_onboarding_record,
+    create_draft,
+    get_draft,
     get_request,
     init_db,
     list_requests,
@@ -96,24 +98,69 @@ class TestOnboardingApp(unittest.TestCase):
 
     def test_status_flow_manager_approval_then_hr_ready(self):
         request_id = create_onboarding_record(self.connection, valid_request_data())
+        record = get_request(self.connection, request_id)
 
-        self.assertTrue(update_status(self.connection, request_id, "Manager Approved"))
+        self.assertTrue(
+            update_status(
+                self.connection,
+                request_id,
+                "Manager Approved",
+                record["ManagerActionToken"],
+            )
+        )
         self.assertEqual(get_request(self.connection, request_id)["Status"], "Manager Approved")
-        self.assertTrue(update_status(self.connection, request_id, "Onboarding Ready"))
+        record = get_request(self.connection, request_id)
+        self.assertTrue(
+            update_status(
+                self.connection,
+                request_id,
+                "Onboarding Ready",
+                record["HrActionToken"],
+            )
+        )
         self.assertEqual(get_request(self.connection, request_id)["Status"], "Onboarding Ready")
 
     def test_status_flow_allows_manager_rejection(self):
         request_id = create_onboarding_record(self.connection, valid_request_data())
+        record = get_request(self.connection, request_id)
 
-        self.assertTrue(update_status(self.connection, request_id, "Rejected"))
+        self.assertTrue(
+            update_status(
+                self.connection,
+                request_id,
+                "Rejected",
+                record["ManagerActionToken"],
+            )
+        )
 
         self.assertEqual(get_request(self.connection, request_id)["Status"], "Rejected")
 
     def test_status_flow_rejects_invalid_transition(self):
         request_id = create_onboarding_record(self.connection, valid_request_data())
+        record = get_request(self.connection, request_id)
 
         with self.assertRaises(ValueError):
-            update_status(self.connection, request_id, "Onboarding Ready")
+            update_status(
+                self.connection,
+                request_id,
+                "Onboarding Ready",
+                record["HrActionToken"],
+            )
+
+    def test_status_flow_rejects_missing_action_token(self):
+        request_id = create_onboarding_record(self.connection, valid_request_data())
+
+        with self.assertRaises(PermissionError):
+            update_status(self.connection, request_id, "Manager Approved")
+
+    def test_create_and_get_draft_stores_reviewed_data(self):
+        data = valid_request_data()
+        token = create_draft(self.connection, data)
+
+        draft = get_draft(self.connection, token)
+
+        self.assertEqual(draft["first_name"], "Asha")
+        self.assertEqual(draft["department"], "IT")
 
     def test_list_requests_returns_newest_requests(self):
         first_request = create_onboarding_record(self.connection, valid_request_data())

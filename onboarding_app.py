@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -110,6 +111,12 @@ def init_db(connection: sqlite3.Connection) -> None:
             OtherComments TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS DraftOnboarding (
+            Token TEXT PRIMARY KEY,
+            Payload TEXT NOT NULL,
+            CreatedDate TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS Departments (
             Department TEXT PRIMARY KEY
         );
@@ -119,6 +126,8 @@ def init_db(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    _ensure_column(connection, "EmployeeOnboarding", "ManagerActionToken", "TEXT")
+    _ensure_column(connection, "EmployeeOnboarding", "HrActionToken", "TEXT")
     connection.executemany(
         "INSERT OR IGNORE INTO Departments (Department) VALUES (?)",
         [(department,) for department in DEPARTMENTS],
@@ -130,10 +139,23 @@ def init_db(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def _ensure_column(
+    connection: sqlite3.Connection, table_name: str, column_name: str, column_type: str
+) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name not in columns:
+        connection.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+        )
+
+
 def normalize_form(raw_values: dict[str, Iterable[str]]) -> dict[str, str]:
     """Convert parsed form values into expected onboarding fields."""
     return {
-        field: next(iter(raw_values.get(field, (""))), "").strip()
+        field: next(iter(raw_values.get(field, ("",))), "").strip()
         for field in FORM_FIELDS
     }
 
@@ -159,6 +181,38 @@ def validate_request(data: dict[str, str]) -> list[str]:
     return errors
 
 
+def create_draft(connection: sqlite3.Connection, data: dict[str, str]) -> str:
+    """Store reviewed form data server-side and return a submission token."""
+    token = str(uuid.uuid4())
+    created_date = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    connection.execute(
+        """
+        INSERT INTO DraftOnboarding (Token, Payload, CreatedDate)
+        VALUES (?, ?, ?)
+        """,
+        (token, json.dumps(data), created_date),
+    )
+    connection.commit()
+    return token
+
+
+def get_draft(connection: sqlite3.Connection, token: str) -> dict[str, str] | None:
+    """Return stored draft form data by token."""
+    row = connection.execute(
+        "SELECT Payload FROM DraftOnboarding WHERE Token = ?", (token,)
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json.loads(row["Payload"])
+    return {field: str(payload.get(field, "")) for field in FORM_FIELDS}
+
+
+def delete_draft(connection: sqlite3.Connection, token: str) -> None:
+    """Remove draft form data after edit or submit."""
+    connection.execute("DELETE FROM DraftOnboarding WHERE Token = ?", (token,))
+    connection.commit()
+
+
 def create_onboarding_record(
     connection: sqlite3.Connection, data: dict[str, str]
 ) -> str:
@@ -168,6 +222,8 @@ def create_onboarding_record(
         raise ValueError("; ".join(errors))
 
     request_id = str(uuid.uuid4())
+    manager_action_token = str(uuid.uuid4())
+    hr_action_token = str(uuid.uuid4())
     created_date = datetime.now(timezone.utc).isoformat(timespec="seconds")
     employee_name = f"{data['first_name']} {data['last_name']}"
     connection.execute(
@@ -179,7 +235,8 @@ def create_onboarding_record(
             EmployeeType, JobTitle, CostCenter, ManagerEmail, SkipManager,
             Country, OfficeLocation, WorkMode, MobileDeviceRequired,
             SpecialApplicationAccess, SpecialAccommodationRequirements,
-            SecurityClearanceRequirements, OtherComments
+            SecurityClearanceRequirements, OtherComments, ManagerActionToken,
+            HrActionToken
         ) VALUES (
             :RequestId, :EmployeeName, :JoinDate, :Manager, :Department, :Location,
             :LaptopRequired, :VPNRequired, :Status, :CreatedDate, :EmployeeId,
@@ -187,7 +244,8 @@ def create_onboarding_record(
             :EmployeeType, :JobTitle, :CostCenter, :ManagerEmail, :SkipManager,
             :Country, :OfficeLocation, :WorkMode, :MobileDeviceRequired,
             :SpecialApplicationAccess, :SpecialAccommodationRequirements,
-            :SecurityClearanceRequirements, :OtherComments
+            :SecurityClearanceRequirements, :OtherComments, :ManagerActionToken,
+            :HrActionToken
         )
         """,
         {
@@ -224,10 +282,23 @@ def create_onboarding_record(
                 "security_clearance_requirements"
             ],
             "OtherComments": data["other_comments"],
+            "ManagerActionToken": manager_action_token,
+            "HrActionToken": hr_action_token,
         },
     )
     connection.commit()
     return request_id
+
+
+def verify_action_token(
+    request: sqlite3.Row, action: str, token: str
+) -> bool:
+    """Return True when the supplied action token matches the request."""
+    token_column = {
+        "manager": "ManagerActionToken",
+        "hr": "HrActionToken",
+    }[action]
+    return bool(token) and request[token_column] == token
 
 
 def get_request(connection: sqlite3.Connection, request_id: str) -> sqlite3.Row | None:
@@ -252,7 +323,7 @@ def list_requests(connection: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def update_status(
-    connection: sqlite3.Connection, request_id: str, status: str
+    connection: sqlite3.Connection, request_id: str, status: str, token: str = ""
 ) -> bool:
     """Update a request status when the transition is allowed."""
     if status not in STATUSES:
@@ -261,6 +332,10 @@ def update_status(
     current = get_request(connection, request_id)
     if current is None:
         return False
+
+    required_action = "hr" if status == "Onboarding Ready" else "manager"
+    if not verify_action_token(current, required_action, token):
+        raise PermissionError("Invalid or missing action token")
 
     allowed = {
         "Submitted": {"Manager Approved", "Rejected"},
@@ -402,7 +477,7 @@ def render_form(data: dict[str, str] | None = None, errors: list[str] | None = N
     )
 
 
-def render_review(data: dict[str, str]) -> bytes:
+def render_review(token: str, data: dict[str, str]) -> bytes:
     rows = (
         ("Employee Details", f"{data['first_name']} {data['last_name']}"),
         ("Employment Details", f"{data['employee_type']} - {data['department']} - {data['job_title']}"),
@@ -410,10 +485,7 @@ def render_review(data: dict[str, str]) -> bytes:
         ("Asset Requirements", f"Laptop: {data['laptop_required']}; Mobile: {data['mobile_device_required']}"),
         ("Access Requirements", f"VPN: {data['vpn_required']}; Apps: {data['special_application_access'] or 'None'}"),
     )
-    hidden = "".join(
-        f'<input type="hidden" name="{name}" value="{html.escape(value)}">'
-        for name, value in data.items()
-    )
+    hidden = f'<input type="hidden" name="token" value="{html.escape(token)}">'
     table_rows = "".join(
         f"<tr><th>{html.escape(label)}</th><td>{html.escape(value)}</td></tr>"
         for label, value in rows
@@ -459,19 +531,38 @@ def render_requests(connection: sqlite3.Connection) -> bytes:
     )
 
 
-def render_status(connection: sqlite3.Connection, request_id: str, message: str = "") -> bytes:
+def render_status(
+    connection: sqlite3.Connection,
+    request_id: str,
+    message: str = "",
+    action_token: str = "",
+) -> bytes:
     request = get_request(connection, request_id)
     if request is None:
         return render_page("Not Found", "<h1>Request not found</h1>")
 
     actions = ""
-    if request["Status"] == "Submitted":
+    if (
+        request["Status"] == "Submitted"
+        and verify_action_token(request, "manager", action_token)
+    ):
         actions = f"""
-        <a class="button" href="/manager/{request_id}?decision=approve">Manager Approve</a>
-        <a class="button" href="/manager/{request_id}?decision=reject">Manager Reject</a>
+        <form method="post" action="/manager/{request_id}">
+          <input type="hidden" name="token" value="{html.escape(action_token)}">
+          <button name="decision" value="approve" type="submit">Manager Approve</button>
+          <button name="decision" value="reject" type="submit">Manager Reject</button>
+        </form>
         """
-    elif request["Status"] == "Manager Approved":
-        actions = f'<a class="button" href="/hr/{request_id}">Ready for Onboarding</a>'
+    elif (
+        request["Status"] == "Manager Approved"
+        and verify_action_token(request, "hr", action_token)
+    ):
+        actions = f"""
+        <form method="post" action="/hr/{request_id}">
+          <input type="hidden" name="token" value="{html.escape(action_token)}">
+          <button type="submit">Ready for Onboarding</button>
+        </form>
+        """
     message_html = f"<p><strong>{html.escape(message)}</strong></p>" if message else ""
     return render_page(
         "Request Status",
@@ -500,6 +591,7 @@ class OnboardingHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
         with connect(self.db_path) as connection:
             init_db(connection)
             if parsed.path == "/":
@@ -509,17 +601,33 @@ class OnboardingHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/requests":
                 self.respond(render_requests(connection))
             elif parsed.path.startswith("/status/"):
-                self.respond(render_status(connection, parsed.path.removeprefix("/status/")))
+                self.respond(
+                    render_status(
+                        connection,
+                        parsed.path.removeprefix("/status/"),
+                        action_token=query.get("token", [""])[0],
+                    )
+                )
             elif parsed.path.startswith("/manager/"):
                 request_id = parsed.path.removeprefix("/manager/")
-                decision = parse_qs(parsed.query).get("decision", [""])[0]
-                status = "Manager Approved" if decision == "approve" else "Rejected"
-                update_status(connection, request_id, status)
-                self.respond(render_status(connection, request_id, f"Status updated to {status}."))
+                self.respond(
+                    render_status(
+                        connection,
+                        request_id,
+                        "Manager approval screen.",
+                        action_token=query.get("token", [""])[0],
+                    )
+                )
             elif parsed.path.startswith("/hr/"):
                 request_id = parsed.path.removeprefix("/hr/")
-                update_status(connection, request_id, "Onboarding Ready")
-                self.respond(render_status(connection, request_id, "Status updated to Onboarding Ready."))
+                self.respond(
+                    render_status(
+                        connection,
+                        request_id,
+                        "HR final confirmation screen.",
+                        action_token=query.get("token", [""])[0],
+                    )
+                )
             else:
                 self.respond(render_page("Not Found", "<h1>Page not found</h1>"), 404)
 
@@ -527,21 +635,87 @@ class OnboardingHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(length).decode()
         data = normalize_form(parse_qs(raw_body))
+        parsed_body = parse_qs(raw_body)
 
         if self.path == "/review":
             errors = validate_request(data)
-            self.respond(render_form(data, errors) if errors else render_review(data))
+            if errors:
+                self.respond(render_form(data, errors))
+            else:
+                with connect(self.db_path) as connection:
+                    init_db(connection)
+                    self.respond(render_review(create_draft(connection, data), data))
         elif self.path == "/edit":
-            self.respond(render_form(data))
-        elif self.path == "/submit":
+            token = next(iter(parsed_body.get("token", ("",))), "")
             with connect(self.db_path) as connection:
                 init_db(connection)
+                draft = get_draft(connection, token)
+                if draft is None:
+                    self.respond(render_page("Not Found", "<h1>Draft not found</h1>"), 404)
+                else:
+                    delete_draft(connection, token)
+                    self.respond(render_form(draft))
+        elif self.path == "/submit":
+            token = next(iter(parsed_body.get("token", ("",))), "")
+            with connect(self.db_path) as connection:
+                init_db(connection)
+                data = get_draft(connection, token)
+                if data is None:
+                    self.respond(render_page("Not Found", "<h1>Draft not found</h1>"), 404)
+                    return
                 try:
                     request_id = create_onboarding_record(connection, data)
                 except ValueError as error:
                     self.respond(render_form(data, str(error).split("; ")), 400)
                 else:
-                    self.respond(render_status(connection, request_id, "Request submitted."))
+                    delete_draft(connection, token)
+                    request = get_request(connection, request_id)
+                    manager_url = (
+                        f"/manager/{request_id}?token={request['ManagerActionToken']}"
+                    )
+                    self.respond(
+                        render_status(
+                            connection,
+                            request_id,
+                            "Request submitted. Share the manager approval link: "
+                            + manager_url,
+                        )
+                    )
+        elif self.path.startswith("/manager/"):
+            request_id = self.path.removeprefix("/manager/")
+            token = next(iter(parsed_body.get("token", ("",))), "")
+            decision = next(iter(parsed_body.get("decision", ("",))), "")
+            status = "Manager Approved" if decision == "approve" else "Rejected"
+            with connect(self.db_path) as connection:
+                init_db(connection)
+                try:
+                    update_status(connection, request_id, status, token)
+                except (PermissionError, ValueError) as error:
+                    self.respond(render_status(connection, request_id, str(error)), 400)
+                else:
+                    request = get_request(connection, request_id)
+                    hr_url = f"/hr/{request_id}?token={request['HrActionToken']}"
+                    message = f"Status updated to {status}."
+                    if status == "Manager Approved":
+                        message += " Share the HR confirmation link: " + hr_url
+                    self.respond(render_status(connection, request_id, message))
+        elif self.path.startswith("/hr/"):
+            request_id = self.path.removeprefix("/hr/")
+            token = next(iter(parsed_body.get("token", ("",))), "")
+            with connect(self.db_path) as connection:
+                init_db(connection)
+                try:
+                    update_status(connection, request_id, "Onboarding Ready", token)
+                except (PermissionError, ValueError) as error:
+                    self.respond(render_status(connection, request_id, str(error)), 400)
+                else:
+                    self.respond(
+                        render_status(
+                            connection,
+                            request_id,
+                            "Status updated to Onboarding Ready.",
+                        )
+                    )
         else:
             self.respond(render_page("Not Found", "<h1>Page not found</h1>"), 404)
 
