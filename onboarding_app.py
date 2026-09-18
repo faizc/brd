@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 
 DB_PATH = Path(__file__).with_name("onboarding.db")
+WRITE_LOCK = threading.RLock()
 STATUSES = ("Submitted", "Manager Approved", "Rejected", "Onboarding Ready")
 EMPLOYEE_TYPES = ("Full Time", "Contractor", "Intern", "Vendor")
 WORK_MODES = ("Remote", "Hybrid", "Office")
@@ -72,71 +74,75 @@ def connect(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
     """Return a SQLite connection configured for dictionary-like rows."""
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 5000")
+    if str(db_path) != ":memory:":
+        connection.execute("PRAGMA journal_mode = WAL")
     return connection
 
 
 def init_db(connection: sqlite3.Connection) -> None:
     """Create the onboarding and lookup tables if they do not exist."""
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS EmployeeOnboarding (
-            RequestId TEXT PRIMARY KEY,
-            EmployeeName TEXT NOT NULL,
-            JoinDate TEXT NOT NULL,
-            Manager TEXT NOT NULL,
-            Department TEXT NOT NULL,
-            Location TEXT NOT NULL,
-            LaptopRequired TEXT NOT NULL,
-            VPNRequired TEXT NOT NULL,
-            Status TEXT NOT NULL,
-            CreatedDate TEXT NOT NULL,
-            EmployeeId TEXT,
-            FirstName TEXT NOT NULL,
-            LastName TEXT NOT NULL,
-            PersonalEmail TEXT NOT NULL,
-            OfficialEmail TEXT,
-            MobileNumber TEXT NOT NULL,
-            EmployeeType TEXT NOT NULL,
-            JobTitle TEXT NOT NULL,
-            CostCenter TEXT NOT NULL,
-            ManagerEmail TEXT NOT NULL,
-            SkipManager TEXT,
-            Country TEXT NOT NULL,
-            OfficeLocation TEXT NOT NULL,
-            WorkMode TEXT NOT NULL,
-            MobileDeviceRequired TEXT NOT NULL,
-            SpecialApplicationAccess TEXT,
-            SpecialAccommodationRequirements TEXT,
-            SecurityClearanceRequirements TEXT,
-            OtherComments TEXT
-        );
+    with WRITE_LOCK:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS EmployeeOnboarding (
+                RequestId TEXT PRIMARY KEY,
+                EmployeeName TEXT NOT NULL,
+                JoinDate TEXT NOT NULL,
+                Manager TEXT NOT NULL,
+                Department TEXT NOT NULL,
+                Location TEXT NOT NULL,
+                LaptopRequired TEXT NOT NULL,
+                VPNRequired TEXT NOT NULL,
+                Status TEXT NOT NULL,
+                CreatedDate TEXT NOT NULL,
+                EmployeeId TEXT,
+                FirstName TEXT NOT NULL,
+                LastName TEXT NOT NULL,
+                PersonalEmail TEXT NOT NULL,
+                OfficialEmail TEXT,
+                MobileNumber TEXT NOT NULL,
+                EmployeeType TEXT NOT NULL,
+                JobTitle TEXT NOT NULL,
+                CostCenter TEXT NOT NULL,
+                ManagerEmail TEXT NOT NULL,
+                SkipManager TEXT,
+                Country TEXT NOT NULL,
+                OfficeLocation TEXT NOT NULL,
+                WorkMode TEXT NOT NULL,
+                MobileDeviceRequired TEXT NOT NULL,
+                SpecialApplicationAccess TEXT,
+                SpecialAccommodationRequirements TEXT,
+                SecurityClearanceRequirements TEXT,
+                OtherComments TEXT
+            );
 
-        CREATE TABLE IF NOT EXISTS DraftOnboarding (
-            Token TEXT PRIMARY KEY,
-            Payload TEXT NOT NULL,
-            CreatedDate TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS DraftOnboarding (
+                Token TEXT PRIMARY KEY,
+                Payload TEXT NOT NULL,
+                CreatedDate TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS Departments (
-            Department TEXT PRIMARY KEY
-        );
+            CREATE TABLE IF NOT EXISTS Departments (
+                Department TEXT PRIMARY KEY
+            );
 
-        CREATE TABLE IF NOT EXISTS OfficeLocations (
-            Location TEXT PRIMARY KEY
-        );
-        """
-    )
-    _ensure_column(connection, "EmployeeOnboarding", "ManagerActionToken", "TEXT")
-    _ensure_column(connection, "EmployeeOnboarding", "HrActionToken", "TEXT")
-    connection.executemany(
-        "INSERT OR IGNORE INTO Departments (Department) VALUES (?)",
-        [(department,) for department in DEPARTMENTS],
-    )
-    connection.executemany(
-        "INSERT OR IGNORE INTO OfficeLocations (Location) VALUES (?)",
-        [(location,) for location in OFFICE_LOCATIONS],
-    )
-    connection.commit()
+            CREATE TABLE IF NOT EXISTS OfficeLocations (
+                Location TEXT PRIMARY KEY
+            );
+            """
+        )
+        _ensure_column(connection, "EmployeeOnboarding", "ManagerActionToken", "TEXT")
+        _ensure_column(connection, "EmployeeOnboarding", "HrActionToken", "TEXT")
+        connection.executemany(
+            "INSERT OR IGNORE INTO Departments (Department) VALUES (?)",
+            [(department,) for department in DEPARTMENTS],
+        )
+        connection.executemany(
+            "INSERT OR IGNORE INTO OfficeLocations (Location) VALUES (?)",
+            [(location,) for location in OFFICE_LOCATIONS],
+        )
+        connection.commit()
 
 
 def _ensure_column(
@@ -185,14 +191,15 @@ def create_draft(connection: sqlite3.Connection, data: dict[str, str]) -> str:
     """Store reviewed form data server-side and return a submission token."""
     token = str(uuid.uuid4())
     created_date = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    connection.execute(
-        """
-        INSERT INTO DraftOnboarding (Token, Payload, CreatedDate)
-        VALUES (?, ?, ?)
-        """,
-        (token, json.dumps(data), created_date),
-    )
-    connection.commit()
+    with WRITE_LOCK:
+        connection.execute(
+            """
+            INSERT INTO DraftOnboarding (Token, Payload, CreatedDate)
+            VALUES (?, ?, ?)
+            """,
+            (token, json.dumps(data), created_date),
+        )
+        connection.commit()
     return token
 
 
@@ -209,8 +216,9 @@ def get_draft(connection: sqlite3.Connection, token: str) -> dict[str, str] | No
 
 def delete_draft(connection: sqlite3.Connection, token: str) -> None:
     """Remove draft form data after edit or submit."""
-    connection.execute("DELETE FROM DraftOnboarding WHERE Token = ?", (token,))
-    connection.commit()
+    with WRITE_LOCK:
+        connection.execute("DELETE FROM DraftOnboarding WHERE Token = ?", (token,))
+        connection.commit()
 
 
 def create_onboarding_record(
@@ -226,67 +234,68 @@ def create_onboarding_record(
     hr_action_token = str(uuid.uuid4())
     created_date = datetime.now(timezone.utc).isoformat(timespec="seconds")
     employee_name = f"{data['first_name']} {data['last_name']}"
-    connection.execute(
-        """
-        INSERT INTO EmployeeOnboarding (
-            RequestId, EmployeeName, JoinDate, Manager, Department, Location,
-            LaptopRequired, VPNRequired, Status, CreatedDate, EmployeeId,
-            FirstName, LastName, PersonalEmail, OfficialEmail, MobileNumber,
-            EmployeeType, JobTitle, CostCenter, ManagerEmail, SkipManager,
-            Country, OfficeLocation, WorkMode, MobileDeviceRequired,
-            SpecialApplicationAccess, SpecialAccommodationRequirements,
-            SecurityClearanceRequirements, OtherComments, ManagerActionToken,
-            HrActionToken
-        ) VALUES (
-            :RequestId, :EmployeeName, :JoinDate, :Manager, :Department, :Location,
-            :LaptopRequired, :VPNRequired, :Status, :CreatedDate, :EmployeeId,
-            :FirstName, :LastName, :PersonalEmail, :OfficialEmail, :MobileNumber,
-            :EmployeeType, :JobTitle, :CostCenter, :ManagerEmail, :SkipManager,
-            :Country, :OfficeLocation, :WorkMode, :MobileDeviceRequired,
-            :SpecialApplicationAccess, :SpecialAccommodationRequirements,
-            :SecurityClearanceRequirements, :OtherComments, :ManagerActionToken,
-            :HrActionToken
+    with WRITE_LOCK:
+        connection.execute(
+            """
+            INSERT INTO EmployeeOnboarding (
+                RequestId, EmployeeName, JoinDate, Manager, Department, Location,
+                LaptopRequired, VPNRequired, Status, CreatedDate, EmployeeId,
+                FirstName, LastName, PersonalEmail, OfficialEmail, MobileNumber,
+                EmployeeType, JobTitle, CostCenter, ManagerEmail, SkipManager,
+                Country, OfficeLocation, WorkMode, MobileDeviceRequired,
+                SpecialApplicationAccess, SpecialAccommodationRequirements,
+                SecurityClearanceRequirements, OtherComments, ManagerActionToken,
+                HrActionToken
+            ) VALUES (
+                :RequestId, :EmployeeName, :JoinDate, :Manager, :Department, :Location,
+                :LaptopRequired, :VPNRequired, :Status, :CreatedDate, :EmployeeId,
+                :FirstName, :LastName, :PersonalEmail, :OfficialEmail, :MobileNumber,
+                :EmployeeType, :JobTitle, :CostCenter, :ManagerEmail, :SkipManager,
+                :Country, :OfficeLocation, :WorkMode, :MobileDeviceRequired,
+                :SpecialApplicationAccess, :SpecialAccommodationRequirements,
+                :SecurityClearanceRequirements, :OtherComments, :ManagerActionToken,
+                :HrActionToken
+            )
+            """,
+            {
+                "RequestId": request_id,
+                "EmployeeName": employee_name,
+                "JoinDate": data["joining_date"],
+                "Manager": data["manager_name"],
+                "Department": data["department"],
+                "Location": f"{data['country']} - {data['office_location']}",
+                "LaptopRequired": data["laptop_required"],
+                "VPNRequired": data["vpn_required"],
+                "Status": "Submitted",
+                "CreatedDate": created_date,
+                "EmployeeId": data["employee_id"],
+                "FirstName": data["first_name"],
+                "LastName": data["last_name"],
+                "PersonalEmail": data["personal_email"],
+                "OfficialEmail": data["official_email"],
+                "MobileNumber": data["mobile_number"],
+                "EmployeeType": data["employee_type"],
+                "JobTitle": data["job_title"],
+                "CostCenter": data["cost_center"],
+                "ManagerEmail": data["manager_email"],
+                "SkipManager": data["skip_manager"],
+                "Country": data["country"],
+                "OfficeLocation": data["office_location"],
+                "WorkMode": data["work_mode"],
+                "MobileDeviceRequired": data["mobile_device_required"],
+                "SpecialApplicationAccess": data["special_application_access"],
+                "SpecialAccommodationRequirements": data[
+                    "special_accommodation_requirements"
+                ],
+                "SecurityClearanceRequirements": data[
+                    "security_clearance_requirements"
+                ],
+                "OtherComments": data["other_comments"],
+                "ManagerActionToken": manager_action_token,
+                "HrActionToken": hr_action_token,
+            },
         )
-        """,
-        {
-            "RequestId": request_id,
-            "EmployeeName": employee_name,
-            "JoinDate": data["joining_date"],
-            "Manager": data["manager_name"],
-            "Department": data["department"],
-            "Location": f"{data['country']} - {data['office_location']}",
-            "LaptopRequired": data["laptop_required"],
-            "VPNRequired": data["vpn_required"],
-            "Status": "Submitted",
-            "CreatedDate": created_date,
-            "EmployeeId": data["employee_id"],
-            "FirstName": data["first_name"],
-            "LastName": data["last_name"],
-            "PersonalEmail": data["personal_email"],
-            "OfficialEmail": data["official_email"],
-            "MobileNumber": data["mobile_number"],
-            "EmployeeType": data["employee_type"],
-            "JobTitle": data["job_title"],
-            "CostCenter": data["cost_center"],
-            "ManagerEmail": data["manager_email"],
-            "SkipManager": data["skip_manager"],
-            "Country": data["country"],
-            "OfficeLocation": data["office_location"],
-            "WorkMode": data["work_mode"],
-            "MobileDeviceRequired": data["mobile_device_required"],
-            "SpecialApplicationAccess": data["special_application_access"],
-            "SpecialAccommodationRequirements": data[
-                "special_accommodation_requirements"
-            ],
-            "SecurityClearanceRequirements": data[
-                "security_clearance_requirements"
-            ],
-            "OtherComments": data["other_comments"],
-            "ManagerActionToken": manager_action_token,
-            "HrActionToken": hr_action_token,
-        },
-    )
-    connection.commit()
+        connection.commit()
     return request_id
 
 
@@ -346,11 +355,12 @@ def update_status(
     if status not in allowed[current["Status"]]:
         raise ValueError(f"Cannot change status from {current['Status']} to {status}")
 
-    connection.execute(
-        "UPDATE EmployeeOnboarding SET Status = ? WHERE RequestId = ?",
-        (status, request_id),
-    )
-    connection.commit()
+    with WRITE_LOCK:
+        connection.execute(
+            "UPDATE EmployeeOnboarding SET Status = ? WHERE RequestId = ?",
+            (status, request_id),
+        )
+        connection.commit()
     return True
 
 
@@ -542,24 +552,18 @@ def render_status(
         return render_page("Not Found", "<h1>Request not found</h1>")
 
     actions = ""
-    if (
-        request["Status"] == "Submitted"
-        and verify_action_token(request, "manager", action_token)
-    ):
+    if request["Status"] == "Submitted":
         actions = f"""
         <form method="post" action="/manager/{request_id}">
-          <input type="hidden" name="token" value="{html.escape(action_token)}">
+          <label>Manager action code<input name="token" required></label>
           <button name="decision" value="approve" type="submit">Manager Approve</button>
           <button name="decision" value="reject" type="submit">Manager Reject</button>
         </form>
         """
-    elif (
-        request["Status"] == "Manager Approved"
-        and verify_action_token(request, "hr", action_token)
-    ):
+    elif request["Status"] == "Manager Approved":
         actions = f"""
         <form method="post" action="/hr/{request_id}">
-          <input type="hidden" name="token" value="{html.escape(action_token)}">
+          <label>HR action code<input name="token" required></label>
           <button type="submit">Ready for Onboarding</button>
         </form>
         """
@@ -591,7 +595,6 @@ class OnboardingHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        query = parse_qs(parsed.query)
         with connect(self.db_path) as connection:
             init_db(connection)
             if parsed.path == "/":
@@ -605,7 +608,6 @@ class OnboardingHandler(BaseHTTPRequestHandler):
                     render_status(
                         connection,
                         parsed.path.removeprefix("/status/"),
-                        action_token=query.get("token", [""])[0],
                     )
                 )
             elif parsed.path.startswith("/manager/"):
@@ -615,7 +617,6 @@ class OnboardingHandler(BaseHTTPRequestHandler):
                         connection,
                         request_id,
                         "Manager approval screen.",
-                        action_token=query.get("token", [""])[0],
                     )
                 )
             elif parsed.path.startswith("/hr/"):
@@ -625,7 +626,6 @@ class OnboardingHandler(BaseHTTPRequestHandler):
                         connection,
                         request_id,
                         "HR final confirmation screen.",
-                        action_token=query.get("token", [""])[0],
                     )
                 )
             else:
@@ -670,15 +670,15 @@ class OnboardingHandler(BaseHTTPRequestHandler):
                 else:
                     delete_draft(connection, token)
                     request = get_request(connection, request_id)
-                    manager_url = (
-                        f"/manager/{request_id}?token={request['ManagerActionToken']}"
-                    )
+                    manager_url = f"/manager/{request_id}"
                     self.respond(
                         render_status(
                             connection,
                             request_id,
-                            "Request submitted. Share the manager approval link: "
-                            + manager_url,
+                            "Request submitted. Share the manager approval link "
+                            + manager_url
+                            + " and manager action code "
+                            + request["ManagerActionToken"],
                         )
                     )
         elif self.path.startswith("/manager/"):
@@ -694,10 +694,15 @@ class OnboardingHandler(BaseHTTPRequestHandler):
                     self.respond(render_status(connection, request_id, str(error)), 400)
                 else:
                     request = get_request(connection, request_id)
-                    hr_url = f"/hr/{request_id}?token={request['HrActionToken']}"
+                    hr_url = f"/hr/{request_id}"
                     message = f"Status updated to {status}."
                     if status == "Manager Approved":
-                        message += " Share the HR confirmation link: " + hr_url
+                        message += (
+                            " Share the HR confirmation link "
+                            + hr_url
+                            + " and HR action code "
+                            + request["HrActionToken"]
+                        )
                     self.respond(render_status(connection, request_id, message))
         elif self.path.startswith("/hr/"):
             request_id = self.path.removeprefix("/hr/")

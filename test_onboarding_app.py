@@ -1,11 +1,18 @@
 """Tests for the employee onboarding application."""
 
+import http.client
+import re
 import sqlite3
+import tempfile
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
+from urllib.parse import urlencode
 
 from onboarding_app import (
     DEPARTMENTS,
     OFFICE_LOCATIONS,
+    OnboardingHandler,
     create_onboarding_record,
     create_draft,
     get_draft,
@@ -178,6 +185,75 @@ class TestOnboardingApp(unittest.TestCase):
 
         self.assertEqual(normalized["first_name"], "Asha")
         self.assertEqual(normalized["last_name"], "")
+
+
+class TestOnboardingHttpFlow(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db_path = f"{self.temp_dir.name}/onboarding-test.db"
+
+        class TestHandler(OnboardingHandler):
+            def log_message(self, format, *args):
+                return
+
+        TestHandler.db_path = db_path
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.start()
+        self.host, self.port = self.server.server_address
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.thread.join()
+        self.server.server_close()
+        self.temp_dir.cleanup()
+
+    def request(self, method, path, body=None):
+        connection = http.client.HTTPConnection(self.host, self.port)
+        headers = {}
+        if body is not None:
+            body = urlencode(body)
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        content = response.read().decode()
+        connection.close()
+        return response.status, content
+
+    def test_http_review_submit_approval_and_hr_flow(self):
+        status, review_body = self.request("POST", "/review", valid_request_data())
+        draft_token = re.search(r'name="token" value="([^"]+)"', review_body).group(1)
+
+        self.assertEqual(status, 200)
+        self.assertIn("Review &amp; Submit", review_body)
+
+        status, submit_body = self.request("POST", "/submit", {"token": draft_token})
+        request_id = re.search(
+            r"<tr><th>Request ID</th><td>([^<]+)</td></tr>", submit_body
+        ).group(1)
+        manager_code = re.search(
+            r"manager action code ([0-9a-f-]+)", submit_body
+        ).group(1)
+
+        self.assertEqual(status, 200)
+        self.assertIn("Submitted", submit_body)
+
+        status, manager_body = self.request(
+            "POST",
+            f"/manager/{request_id}",
+            {"token": manager_code, "decision": "approve"},
+        )
+        hr_code = re.search(r"HR action code ([0-9a-f-]+)", manager_body).group(1)
+
+        self.assertEqual(status, 200)
+        self.assertIn("Manager Approved", manager_body)
+
+        status, hr_body = self.request(
+            "POST", f"/hr/{request_id}", {"token": hr_code}
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("Onboarding Ready", hr_body)
 
 
 if __name__ == "__main__":
