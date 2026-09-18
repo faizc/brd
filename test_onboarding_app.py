@@ -103,6 +103,16 @@ class TestOnboardingApp(unittest.TestCase):
 
         self.assertIn("Department must be a configured option", validate_request(data))
 
+    def test_validate_request_rejects_invalid_contact_fields(self):
+        data = valid_request_data()
+        data["personal_email"] = "not-an-email"
+        data["mobile_number"] = "abc"
+
+        errors = validate_request(data)
+
+        self.assertIn("Personal Email must be a valid email", errors)
+        self.assertIn("Mobile Number must be a valid phone number", errors)
+
     def test_status_flow_manager_approval_then_hr_ready(self):
         request_id = create_onboarding_record(self.connection, valid_request_data())
         record = get_request(self.connection, request_id)
@@ -190,13 +200,13 @@ class TestOnboardingApp(unittest.TestCase):
 class TestOnboardingHttpFlow(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        db_path = f"{self.temp_dir.name}/onboarding-test.db"
+        self.db_path = f"{self.temp_dir.name}/onboarding-test.db"
 
         class TestHandler(OnboardingHandler):
             def log_message(self, format, *args):
                 return
 
-        TestHandler.db_path = db_path
+        TestHandler.db_path = self.db_path
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
@@ -225,9 +235,7 @@ class TestOnboardingHttpFlow(unittest.TestCase):
         request_id = re.search(
             r"<tr><th>Request ID</th><td>([^<]+)</td></tr>", submit_body
         ).group(1)
-        manager_code = re.search(
-            r"manager action code ([0-9a-f-]+)", submit_body
-        ).group(1)
+        manager_code = self.get_request_token(request_id, "ManagerActionToken")
 
         self.assertEqual(status, 200)
         self.assertIn("Submitted", submit_body)
@@ -237,7 +245,7 @@ class TestOnboardingHttpFlow(unittest.TestCase):
             f"/manager/{request_id}",
             {"token": manager_code, "decision": "approve"},
         )
-        hr_code = re.search(r"HR action code ([0-9a-f-]+)", manager_body).group(1)
+        hr_code = self.get_request_token(request_id, "HrActionToken")
 
         self.assertEqual(status, 200)
         self.assertIn("Manager Approved", manager_body)
@@ -269,9 +277,7 @@ class TestOnboardingHttpFlow(unittest.TestCase):
         request_id = re.search(
             r"<tr><th>Request ID</th><td>([^<]+)</td></tr>", submit_body
         ).group(1)
-        manager_code = re.search(
-            r"manager action code ([0-9a-f-]+)", submit_body
-        ).group(1)
+        manager_code = self.get_request_token(request_id, "ManagerActionToken")
         self.request(
             "POST",
             f"/manager/{request_id}",
@@ -285,6 +291,22 @@ class TestOnboardingHttpFlow(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("Invalid or missing action token", hr_body)
 
+    def test_http_manager_action_rejects_invalid_decision(self):
+        status, submit_body = self.submit_valid_request()
+        request_id = re.search(
+            r"<tr><th>Request ID</th><td>([^<]+)</td></tr>", submit_body
+        ).group(1)
+        manager_code = self.get_request_token(request_id, "ManagerActionToken")
+
+        status, manager_body = self.request(
+            "POST",
+            f"/manager/{request_id}",
+            {"token": manager_code, "decision": "maybe"},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("Invalid manager decision", manager_body)
+
     def submit_valid_request(self):
         status, review_body = self.request("POST", "/review", valid_request_data())
         draft_token = re.search(r'name="token" value="([^"]+)"', review_body).group(1)
@@ -297,6 +319,14 @@ class TestOnboardingHttpFlow(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("Submitted", submit_body)
         return status, submit_body
+
+    def get_request_token(self, request_id, column):
+        with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            return connection.execute(
+                f"SELECT {column} FROM EmployeeOnboarding WHERE RequestId = ?",
+                (request_id,),
+            ).fetchone()[column]
 
 
 if __name__ == "__main__":

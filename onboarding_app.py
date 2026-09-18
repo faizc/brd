@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import hmac
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -18,6 +19,12 @@ from urllib.parse import parse_qs, urlparse
 DB_PATH = Path(__file__).with_name("onboarding.db")
 WRITE_LOCK = threading.RLock()
 STATUSES = ("Submitted", "Manager Approved", "Rejected", "Onboarding Ready")
+ALLOWED_TRANSITIONS = {
+    "Submitted": {"Manager Approved", "Rejected"},
+    "Manager Approved": {"Onboarding Ready"},
+    "Rejected": set(),
+    "Onboarding Ready": set(),
+}
 EMPLOYEE_TYPES = ("Full Time", "Contractor", "Intern", "Vendor")
 WORK_MODES = ("Remote", "Hybrid", "Office")
 DEPARTMENTS = ("Finance", "HR", "IT", "Sales")
@@ -49,6 +56,9 @@ FORM_FIELDS = (
     "security_clearance_requirements",
     "other_comments",
 )
+
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9\s().-]{7,19}$")
 
 REQUIRED_FIELDS = (
     "first_name",
@@ -125,6 +135,15 @@ def init_db(connection: sqlite3.Connection) -> None:
                 CreatedDate TEXT NOT NULL
             );
 
+                CREATE TABLE IF NOT EXISTS NotificationOutbox (
+                    NotificationId TEXT PRIMARY KEY,
+                    RequestId TEXT NOT NULL,
+                    RecipientRole TEXT NOT NULL,
+                    Recipient TEXT NOT NULL,
+                    Message TEXT NOT NULL,
+                    CreatedDate TEXT NOT NULL
+                );
+
             CREATE TABLE IF NOT EXISTS Departments (
                 Department TEXT PRIMARY KEY
             );
@@ -186,6 +205,11 @@ def validate_request(data: dict[str, str]) -> list[str]:
     for field in ("laptop_required", "mobile_device_required", "vpn_required"):
         if data.get(field) and data[field] not in ("Yes", "No"):
             errors.append(f"{field.replace('_', ' ').title()} must be Yes or No")
+    for field in ("personal_email", "official_email", "manager_email"):
+        if data.get(field) and not EMAIL_PATTERN.match(data[field]):
+            errors.append(f"{field.replace('_', ' ').title()} must be a valid email")
+    if data.get("mobile_number") and not PHONE_PATTERN.match(data["mobile_number"]):
+        errors.append("Mobile Number must be a valid phone number")
     return errors
 
 
@@ -298,7 +322,45 @@ def create_onboarding_record(
             },
         )
         connection.commit()
+    create_notification(
+        connection,
+        request_id,
+        "Manager",
+        data["manager_email"],
+        f"Review onboarding request {request_id}. Action code: {manager_action_token}",
+    )
     return request_id
+
+
+def create_notification(
+    connection: sqlite3.Connection,
+    request_id: str,
+    recipient_role: str,
+    recipient: str,
+    message: str,
+) -> str:
+    """Queue an out-of-band workflow notification for delivery."""
+    notification_id = str(uuid.uuid4())
+    created_date = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with WRITE_LOCK:
+        connection.execute(
+            """
+            INSERT INTO NotificationOutbox (
+                NotificationId, RequestId, RecipientRole, Recipient, Message,
+                CreatedDate
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                notification_id,
+                request_id,
+                recipient_role,
+                recipient,
+                message,
+                created_date,
+            ),
+        )
+        connection.commit()
+    return notification_id
 
 
 def verify_action_token(
@@ -349,13 +411,7 @@ def update_status(
     if not verify_action_token(current, required_action, token):
         raise PermissionError("Invalid or missing action token")
 
-    allowed = {
-        "Submitted": {"Manager Approved", "Rejected"},
-        "Manager Approved": {"Onboarding Ready"},
-        "Rejected": set(),
-        "Onboarding Ready": set(),
-    }
-    if status not in allowed[current["Status"]]:
+    if status not in ALLOWED_TRANSITIONS[current["Status"]]:
         raise ValueError(f"Cannot change status from {current['Status']} to {status}")
 
     with WRITE_LOCK:
@@ -555,7 +611,8 @@ def render_status(
         return render_page("Not Found", "<h1>Request not found</h1>")
 
     actions = ""
-    if request["Status"] == "Submitted":
+    available_transitions = ALLOWED_TRANSITIONS[request["Status"]]
+    if {"Manager Approved", "Rejected"} <= available_transitions:
         actions = f"""
         <form method="post" action="/manager/{request_id}">
           <label>Manager action code<input name="token" required></label>
@@ -563,7 +620,7 @@ def render_status(
           <button name="decision" value="reject" type="submit">Manager Reject</button>
         </form>
         """
-    elif request["Status"] == "Manager Approved":
+    elif "Onboarding Ready" in available_transitions:
         actions = f"""
         <form method="post" action="/hr/{request_id}">
           <label>HR action code<input name="token" required></label>
@@ -678,16 +735,21 @@ class OnboardingHandler(BaseHTTPRequestHandler):
                         render_status(
                             connection,
                             request_id,
-                            "Request submitted. Share the manager approval link "
-                            + manager_url
-                            + " and manager action code "
-                            + request["ManagerActionToken"],
+                            "Request submitted. Manager approval details were queued "
+                            "for out-of-band delivery. Approval link: "
+                            + manager_url,
                         )
                     )
         elif self.path.startswith("/manager/"):
             request_id = self.path.removeprefix("/manager/")
             token = next(iter(parsed_body.get("token", ("",))), "")
             decision = next(iter(parsed_body.get("decision", ("",))), "")
+            if decision not in {"approve", "reject"}:
+                self.respond(
+                    render_page("Bad Request", "<h1>Invalid manager decision</h1>"),
+                    400,
+                )
+                return
             status = "Manager Approved" if decision == "approve" else "Rejected"
             with connect(self.db_path) as connection:
                 init_db(connection)
@@ -700,11 +762,18 @@ class OnboardingHandler(BaseHTTPRequestHandler):
                     hr_url = f"/hr/{request_id}"
                     message = f"Status updated to {status}."
                     if status == "Manager Approved":
+                        create_notification(
+                            connection,
+                            request_id,
+                            "HR",
+                            "HR team",
+                            f"Confirm onboarding readiness for request {request_id}. "
+                            f"Action code: {request['HrActionToken']}",
+                        )
                         message += (
-                            " Share the HR confirmation link "
+                            " HR confirmation details were queued for out-of-band "
+                            "delivery. Confirmation link: "
                             + hr_url
-                            + " and HR action code "
-                            + request["HrActionToken"]
                         )
                     self.respond(render_status(connection, request_id, message))
         elif self.path.startswith("/hr/"):
