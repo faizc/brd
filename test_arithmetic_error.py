@@ -24,6 +24,10 @@ class TestCalculate(unittest.TestCase):
         with self.assertRaises(TypeError):
             calculate(True, 2)
 
+    def test_boolean_second_arg_raises_type_error(self):
+        with self.assertRaises(TypeError):
+            calculate(2, True)
+
     def test_non_numeric_first_arg_raises_type_error(self):
         with self.assertRaises(TypeError):
             calculate("10", 2)

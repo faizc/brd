@@ -13,8 +13,10 @@ def calculate(a, b):
         TypeError: If either a or b is not an int or float.
         ZeroDivisionError: If b is 0, since division by zero is undefined.
     """
-    if not _is_valid_number(a) or not _is_valid_number(b):
-        raise TypeError("Both a and b must be int or float")
+    if not _is_valid_number(a):
+        raise TypeError(f"Expected a to be int or float, got {type(a).__name__}")
+    if not _is_valid_number(b):
+        raise TypeError(f"Expected b to be int or float, got {type(b).__name__}")
 
     sum_result = a + b
     diff_result = a - b
