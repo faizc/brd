@@ -307,6 +307,17 @@ class TestOnboardingHttpFlow(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("Invalid manager decision", manager_body)
 
+    def test_http_edit_restores_reviewed_form_data(self):
+        status, review_body = self.request("POST", "/review", valid_request_data())
+        draft_token = re.search(r'name="token" value="([^"]+)"', review_body).group(1)
+
+        status, edit_body = self.request("POST", "/edit", {"token": draft_token})
+
+        self.assertEqual(status, 200)
+        self.assertIn("New Employee Form", edit_body)
+        self.assertIn('value="Asha"', edit_body)
+        self.assertIn('value="Rao"', edit_body)
+
     def submit_valid_request(self):
         status, review_body = self.request("POST", "/review", valid_request_data())
         draft_token = re.search(r'name="token" value="([^"]+)"', review_body).group(1)

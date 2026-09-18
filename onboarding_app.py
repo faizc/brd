@@ -5,7 +5,6 @@ from __future__ import annotations
 import html
 import hmac
 import json
-import re
 import sqlite3
 import threading
 import uuid
@@ -56,9 +55,6 @@ FORM_FIELDS = (
     "security_clearance_requirements",
     "other_comments",
 )
-
-EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9\s().-]{7,19}$")
 
 REQUIRED_FIELDS = (
     "first_name",
@@ -135,14 +131,14 @@ def init_db(connection: sqlite3.Connection) -> None:
                 CreatedDate TEXT NOT NULL
             );
 
-                CREATE TABLE IF NOT EXISTS NotificationOutbox (
-                    NotificationId TEXT PRIMARY KEY,
-                    RequestId TEXT NOT NULL,
-                    RecipientRole TEXT NOT NULL,
-                    Recipient TEXT NOT NULL,
-                    Message TEXT NOT NULL,
-                    CreatedDate TEXT NOT NULL
-                );
+            CREATE TABLE IF NOT EXISTS NotificationOutbox (
+                NotificationId TEXT PRIMARY KEY,
+                RequestId TEXT NOT NULL,
+                RecipientRole TEXT NOT NULL,
+                Recipient TEXT NOT NULL,
+                Message TEXT NOT NULL,
+                CreatedDate TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS Departments (
                 Department TEXT PRIMARY KEY
@@ -187,6 +183,29 @@ def normalize_form(raw_values: dict[str, Iterable[str]]) -> dict[str, str]:
     }
 
 
+def is_valid_email(value: str) -> bool:
+    """Return True for a simple bounded email shape check."""
+    if not value or any(character.isspace() for character in value) or len(value) > 254:
+        return False
+    local, separator, domain = value.partition("@")
+    return bool(local and separator and "." in domain and not domain.endswith("."))
+
+
+def is_valid_phone(value: str) -> bool:
+    """Return True for a simple bounded phone number shape check."""
+    allowed_punctuation = set(" +().-")
+    digits = [character for character in value if character.isdigit()]
+    starts_correctly = value.lstrip().startswith(("+", "0", "1", "2", "3", "4"))
+    starts_correctly = starts_correctly or value.lstrip().startswith(
+        ("5", "6", "7", "8", "9")
+    )
+    return (
+        8 <= len(digits) <= 20
+        and starts_correctly
+        and all(character.isdigit() or character in allowed_punctuation for character in value)
+    )
+
+
 def validate_request(data: dict[str, str]) -> list[str]:
     """Return validation errors for a submitted onboarding request."""
     errors = [
@@ -206,9 +225,9 @@ def validate_request(data: dict[str, str]) -> list[str]:
         if data.get(field) and data[field] not in ("Yes", "No"):
             errors.append(f"{field.replace('_', ' ').title()} must be Yes or No")
     for field in ("personal_email", "official_email", "manager_email"):
-        if data.get(field) and not EMAIL_PATTERN.match(data[field]):
+        if data.get(field) and not is_valid_email(data[field]):
             errors.append(f"{field.replace('_', ' ').title()} must be a valid email")
-    if data.get("mobile_number") and not PHONE_PATTERN.match(data["mobile_number"]):
+    if data.get("mobile_number") and not is_valid_phone(data["mobile_number"]):
         errors.append("Mobile Number must be a valid phone number")
     return errors
 
@@ -414,9 +433,17 @@ def update_status(
     if status not in ALLOWED_TRANSITIONS[current["Status"]]:
         raise ValueError(f"Cannot change status from {current['Status']} to {status}")
 
+    token_column = {
+        "manager": "ManagerActionToken",
+        "hr": "HrActionToken",
+    }[required_action]
     with WRITE_LOCK:
         connection.execute(
-            "UPDATE EmployeeOnboarding SET Status = ? WHERE RequestId = ?",
+            f"""
+            UPDATE EmployeeOnboarding
+            SET Status = ?, {token_column} = NULL
+            WHERE RequestId = ?
+            """,
             (status, request_id),
         )
         connection.commit()
